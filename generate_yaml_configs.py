@@ -195,19 +195,21 @@ def render_template(template_content, provider_data):
             else:
                 return true_part if condition_result else false_part
         
-        # Handle split operations
+        # Handle split operations - THIS IS THE KEY FIX
         elif '.split(' in expr:
             if 'Model(s).split' in expr:
                 models_field = data.get('Model(s)', '')
                 if '|' in models_field and not models_field.startswith('http'):
+                    # Parse pipe-separated models and return as proper array format
                     model_list = [model.strip() for model in models_field.split('|') if model.strip()]
-                    return str(model_list)
+                    # Return as YAML-compatible array format
+                    return str(model_list).replace("'", '"')
                 elif models_field and not models_field.startswith('http'):
                     return f'["{models_field}"]'
                 else:
                     return '[]'
         
-        # Handle array access
+        # Handle array access - THIS IS ANOTHER KEY FIX
         elif '[0]' in expr and 'Model(s)' in expr:
             models_field = data.get('Model(s)', '')
             if '|' in models_field and not models_field.startswith('http'):
@@ -229,7 +231,7 @@ def render_template(template_content, provider_data):
                     result += data.get(part, '')
             return result
         
-        # Handle URL construction
+        # Handle URL construction - THIS FIXES THE Base_URL ISSUE
         elif 'Base_URL' in expr and ('chat/completions' in expr or '/health' in expr):
             base_url = data.get('Base_URL', '')
             if 'chat/completions' in expr and 'not in' in expr:
@@ -254,7 +256,8 @@ def render_template(template_content, provider_data):
             return clean_data[expr]
         
         # Then try complex expression evaluation
-        return str(evaluate_complex_expression(expr, clean_data))
+        result = evaluate_complex_expression(expr, clean_data)
+        return str(result)
     
     # Apply template replacements
     template_pattern = r'\{\{\s*([^}]+)\s*\}\}'

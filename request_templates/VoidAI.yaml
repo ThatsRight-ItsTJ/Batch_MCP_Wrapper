@@ -52,7 +52,7 @@ template:
 # Additional Metadata
 metadata:
   created_from: "CSV import"
-  timestamp: "2025-09-15T14:40:00.483444"
+  timestamp: "2025-09-15T14:45:43.152248"
   category: "authenticated"
   
 # Request Configuration Templates
