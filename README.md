@@ -1,66 +1,74 @@
-# Aggregator MCP server generator — 3-tier capability detection + capability-specific schemas
+# Batch MCP Wrapper - AI Provider Aggregator
 
+A powerful MCP (Model Context Protocol) server that aggregates multiple AI providers from a CSV file into a single unified interface. Each provider's models are exposed as namespaced tools (e.g., `OpenRouter::gpt-4o`, `Pollinations::flux-1`) with automatic capability detection and authentication handling.
 
-* **Normalizes messy CSV** into columns `Name`, `Base_URL`, `APIKey`, `Models`, `AuthMode`, `Template`, `Rate Limit/cost info`.
-* **Creates a `.env` file** and sets an env var for each API exactly as you asked: `<Name>API_Key` (and also a sanitized uppercase variant for convenience).
-* **Builds a single MCP aggregator server** (FastAPI) that exposes every provider model as a namespaced tool `Provider::Model`.
-* **Detects model capabilities** using a 3-tier approach:
+## 🚀 Quick Start
 
-  1. **Provider metadata** (model list endpoint if present).
-  2. **Local heuristics** based on model name.
-  3. **Internet lookup fallback** (Hugging Face model metadata API) for high accuracy on obscure models — results are cached locally.
-* **Creates capability-specific parameter schemas** (text, image, audio, vision, embedding) and uses them for each tool.
-* **Implements `tools/list` and `tools/execute`**. `tools/execute` forms payloads best-effort based on capability and provider patterns, and tries to intelligently extract the provider response.
-* **Supports multiple authentication modes** via `AuthMode` column (bearer, header:NAME, query:NAME, none).
-* **Supports provider adapters** via `Template` column (YAML/JSON files that fully control request/response handling).
+1. **Install dependencies:**
+```bash
+pip install fastapi uvicorn requests python-dotenv pandas
+```
 
-> Notes:
->
-> * The script expects `routers.base_router.MCPBaseRouter` from the `freedanfan/mcp-server` repo to be importable (same as earlier). If you prefer, I can embed a tiny local MCP JSON-RPC handler instead — say so and I’ll adapt.
-> * The internet lookup uses Hugging Face's public model metadata endpoint. If many lookups are required, you may want to provide an HF token (optional) to avoid rate limits. Results are cached in `.model_caps_cache.json`.
+2. **Prepare your CSV file** with AI providers (see format below)
 
----
+3. **Start the MCP server:**
+```bash
+python aggregator_server.py --csv g4f_providers_example.csv --port 12000
+```
 
-## How to use
+4. **Connect your LLM client** to `http://127.0.0.1:12000/api`
 
-1. Put your CSV at `providers.csv` (or pass another path as `--csv`).
+## 📋 CSV Format
 
-## 📝 CSV Format
+Your CSV should contain the following columns:
 
 | Name           | Base_URL                     | APIKey         | Models                              | AuthMode        | Template                            | Rate Limit/cost info |
 |----------------|------------------------------|----------------|-------------------------------------|-----------------|-------------------------------------|----------------------|
-| OpenAI-Primary | https://api.openai.com/v1    | sk-xxxx        | gpt-4|gpt-3.5-turbo                 | bearer          |                                     |                      |
-| Pollinations   | https://text.pollinations.ai |                | https://pollinations.ai/api/models  | bearer          |                                     |         10 rpm       |
-| CustomAPI      | https://api.custom.com/v1    | api_key_123    | custom-model                        | header:X-Api-Key| custom_adapter.yaml                 |         100 rpm      |
-- **Models** can be:
-  - A `|`‑delimited list of model IDs.
-  - A URL returning a list of models (JSON).
-- **AuthMode** specifies how to attach the API key (optional, defaults to `bearer`):
+| OpenRouter     | https://openrouter.ai/api/v1 | sk-xxxx        | gpt-4o\|claude-3-sonnet            | bearer          |                                     | 100 RPM              |
+| Pollinations   | https://text.pollinations.ai |                | https://pollinations.ai/api/models  | none            |                                     | 10 RPM               |
+| CustomAPI      | https://api.custom.com/v1    | api_key_123    | custom-model                        | header:X-Api-Key| custom_adapter.yaml                 | 1000 RPM             |
+
+### Column Details:
+
+- **Name**: Provider identifier (will be used as namespace)
+- **Base_URL**: API endpoint URL
+- **APIKey**: API key (will be stored in .env file as `{Name}API_Key`)
+- **Models**: Can be:
+  - Pipe-delimited list: `model1|model2|model3`
+  - URL to model list endpoint: `https://api.provider.com/models`
+  - Single model name: `gpt-4`
+- **AuthMode** (optional, defaults to `bearer`):
   - `bearer` - Bearer token authentication
   - `header:HeaderName` - Custom header (e.g., `header:X-Api-Key`)
   - `query:param` - Query parameter (e.g., `query:api_key`)
   - `none` - No authentication
-- **Template** specifies a path or URL to a provider adapter (YAML/JSON) that fully controls request/response handling (optional).
+- **Template** (optional): Path/URL to custom YAML/JSON adapter
+- **Rate Limit/cost info** (optional): Human-readable rate limit information
 
-### AuthMode Examples:
+## 🔧 Advanced Configuration
 
-```csv
-# Using custom header authentication
-MyAPI,https://api.example.com/v1,my_key,model1|model2,header:Authorization,,"1000 RPM"
-
-# Using query parameter authentication
-AnotherAPI,https://api.another.com/v1,secret_key,model3,query:api_key,,"500 RPM"
-```
-
-### Template Example:
+### Authentication Modes
 
 ```csv
-# Using a custom template for request/response handling
-CustomProvider,https://api.custom.com/v1,custom_key,custom-model,header:X-Api-Key,custom_adapter.yaml,"200 RPM"
+# Bearer token (default)
+OpenAI,https://api.openai.com/v1,sk-xxxx,gpt-4,bearer
+
+# Custom header
+Anthropic,https://api.anthropic.com,key123,claude-3,header:x-api-key
+
+# Query parameter
+SomeAPI,https://api.example.com,secret,model1,query:apikey
+
+# No authentication
+PublicAPI,https://free.api.com,,public-model,none
 ```
 
-Template file (`custom_adapter.yaml`) example:
+### Custom Templates
+
+For providers requiring special request/response handling, create a YAML template:
+
 ```yaml
+# custom_adapter.yaml
 request:
   text:
     method: POST
@@ -74,78 +82,206 @@ response:
   text: "$.choices[0].message.content"
 ```
 
-2. Run:
+## 🔌 Connecting to LLM Clients
+
+### Claude Desktop
+
+Add to your `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "batch-mcp-wrapper": {
+      "command": "python",
+      "args": ["/path/to/aggregator_server.py", "--csv", "/path/to/providers.csv", "--port", "12000"],
+      "env": {}
+    }
+  }
+}
+```
+
+### Continue.dev
+
+Add to your `config.json`:
+
+```json
+{
+  "mcpServers": [
+    {
+      "name": "batch-mcp-wrapper",
+      "serverUrl": "http://127.0.0.1:12000/api"
+    }
+  ]
+}
+```
+
+### Cline (VSCode Extension)
+
+Add to your MCP settings:
+
+```json
+{
+  "mcpServers": {
+    "batch-mcp-wrapper": {
+      "command": "python",
+      "args": ["/path/to/aggregator_server.py", "--csv", "/path/to/providers.csv"],
+      "cwd": "/path/to/Batch_MCP_Wrapper"
+    }
+  }
+}
+```
+
+### Generic MCP Client
+
+Connect to the JSON-RPC endpoint at `http://127.0.0.1:12000/api` and use these methods:
+
+- `tools/list` - Get all available provider::model tools
+- `tools/execute` - Execute requests to specific models
+
+## 📡 API Usage Examples
+
+### List Available Tools
 
 ```bash
-pip install fastapi uvicorn requests python-dotenv pandas
-# make sure freedanfan mcp-server's `routers` package is on PYTHONPATH (or copy base_router.py next to this script)
-python aggregator_server.py --csv providers.csv --port 12000
+curl -X POST http://127.0.0.1:12000/api \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "tools/list",
+    "params": {}
+  }'
 ```
 
-3. The script will write `.env` with env vars like: `MyProviderAPI_Key=the_key_from_csv`. It will also set the same env var in the running process.
-4. MCP clients can connect to `http://127.0.0.1:12000/api` and call JSON-RPC methods:
+### Execute Text Generation
 
-   * `tools/list` → returns `tools` with `id` like `Provider::model-name` and `parameters` (capability schema).
-   * `tools/execute` → send `{"id":"Provider::model", "params": { ... capability-specific params ... }}`.
-
----
-
-## Examples of use (JSON-RPC calls)
-
-1. List tools:
-
-```json
-{
-  "jsonrpc":"2.0",
-  "id":"req-1",
-  "method":"tools/list",
-  "params": {}
-}
-```
-
-2. Call a text model (example):
-
-```json
-{
-  "jsonrpc":"2.0",
-  "id":"req-2",
-  "method":"tools/execute",
-  "params": {
-    "id": "OpenAI::gpt-4o",
+```bash
+curl -X POST http://127.0.0.1:12000/api \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "tools/execute",
     "params": {
-      "prompt": "Write a 3-line haiku about the ocean."
+      "id": "OpenRouter::gpt-4o",
+      "params": {
+        "prompt": "Write a haiku about coding"
+      }
     }
-  }
-}
+  }'
 ```
 
-3. Call an embedding model:
+### Execute Image Generation
 
-```json
-{
-  "jsonrpc":"2.0",
-  "id":"req-3",
-  "method":"tools/execute",
-  "params": {
-    "id": "SomeProvider::my-embed-model",
+```bash
+curl -X POST http://127.0.0.1:12000/api \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "3",
+    "method": "tools/execute",
     "params": {
-      "text_batch": ["hello world", "how are you"]
+      "id": "Pollinations::flux-1",
+      "params": {
+        "prompt": "A beautiful sunset over mountains",
+        "width": 1024,
+        "height": 1024
+      }
     }
-  }
-}
+  }'
 ```
 
----
+### Execute Embeddings
 
-## Implementation caveats & recommended improvements
+```bash
+curl -X POST http://127.0.0.1:12000/api \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "4",
+    "method": "tools/execute",
+    "params": {
+      "id": "OpenAI::text-embedding-3-small",
+      "params": {
+        "text_batch": ["hello world", "how are you"]
+      }
+    }
+  }'
+```
 
-* **Provider-specific request shapes**: The script uses *best-effort* payload shapes (common patterns). For complete control over request/response handling, use the `Template` column with YAML/JSON provider adapters.
-* **Authentication modes**: The script supports multiple authentication methods via the `AuthMode` column:
-  - `bearer` - Bearer token (default)
-  - `header:HeaderName` - Custom header (e.g., `header:X-Api-Key`)
-  - `query:param` - Query parameter (e.g., `query:api_key`)
-  - `none` - No authentication
-* **Template system**: When a `Template` is specified, it fully controls request/response handling. The template supports variable substitution (`{model_id}`, `{Base_URL}`, `{prompt}`, etc.) and JSONPath-like response extraction.
-* **Hugging Face rate limits**: the internet lookup uses HF public endpoints. If doing many lookups, supply `--hf-token` or pre-warm the cache.
-* **Extensible cache**: it's a simple JSON file. For more robustness use sqlite or Redis.
-* **Error handling**: When using templates, ensure they handle edge cases appropriately. The script falls back to default behavior if template loading fails.
+## 🎯 Key Features
+
+- **Unified Interface**: Access multiple AI providers through a single MCP server
+- **Automatic Capability Detection**: 3-tier system (provider metadata → heuristics → Hugging Face API)
+- **Flexible Authentication**: Support for bearer tokens, custom headers, query parameters
+- **Environment Management**: Auto-generates `.env` file with API keys
+- **Custom Templates**: Full control over request/response handling for complex providers
+- **Rate Limit Awareness**: Displays rate limit information for each provider
+- **Capability-Specific Schemas**: Different parameter schemas for text, image, embedding, audio, vision
+- **Caching**: Model capability results are cached locally for performance
+
+## 🔧 Command Line Options
+
+```bash
+python aggregator_server.py [OPTIONS]
+
+Options:
+  --csv TEXT              Path to providers CSV file [default: providers.csv]
+  --port INTEGER          Port to run server on [default: 12000]
+  --dotenv TEXT           Path to .env file [default: .env]
+  --hf-token TEXT         Hugging Face token for model lookup [optional]
+  --auth-mode TEXT        Default auth mode [default: bearer]
+  --template TEXT         Default template path/URL [optional]
+```
+
+## 🔍 Troubleshooting
+
+### Server Won't Start
+- Check if port is already in use: `lsof -i :12000`
+- Verify CSV file format and path
+- Check Python dependencies are installed
+
+### Authentication Errors
+- Verify API keys are correctly set in `.env` file
+- Check `AuthMode` column in CSV matches provider requirements
+- Ensure environment variables follow format: `{ProviderName}API_Key`
+
+### Model Not Found
+- Check if provider's model list endpoint is accessible
+- Verify model names in CSV match provider's actual model IDs
+- Check cache file `.model_caps_cache.json` for stale entries
+
+### Connection Refused
+- Ensure server is running: `ps aux | grep aggregator_server`
+- Check firewall settings
+- Verify correct port and host configuration
+
+## 📁 File Structure
+
+```
+Batch_MCP_Wrapper/
+├── aggregator_server.py      # Main MCP server
+├── g4f_providers_example.csv # Example provider configuration
+├── README.md                 # This file
+├── .env                      # Generated API keys (auto-created)
+├── .model_caps_cache.json    # Model capability cache (auto-created)
+└── .gitignore               # Git ignore rules
+```
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create your feature branch: `git checkout -b feature/amazing-feature`
+3. Commit your changes: `git commit -m 'Add amazing feature'`
+4. Push to the branch: `git push origin feature/amazing-feature`
+5. Open a Pull Request
+
+## 📄 License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## 🙏 Acknowledgments
+
+- Built on the Model Context Protocol (MCP) standard
+- Uses Hugging Face API for model capability detection
+- Inspired by the need to unify multiple AI provider APIs
