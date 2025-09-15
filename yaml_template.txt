@@ -1,0 +1,102 @@
+# API Configuration Template
+# This template can be used by Python scripts to generate YAML files from CSV data
+# Template variables are enclosed in double curly braces {{ }}
+
+# Service Configuration
+service_name: "{{ Name }}"
+description: "API configuration for {{ Name }}"
+
+# API Endpoint Configuration
+api:
+  base_url: "{{ Base_URL }}"
+  endpoints:
+    primary: "{{ Base_URL }}"
+    models: "{{ Model(s) if Model(s).startswith('http') else '' }}"
+
+# Authentication Configuration
+authentication:
+  mode: "{{ AuthMode }}"
+  api_key: "{{ APIKey if APIKey else 'not_required' }}"
+  # For bearer token authentication
+  headers:
+    Authorization: "{{ 'Bearer ' + APIKey if AuthMode == 'bearer' and APIKey else 'not_required' }}"
+    Content-Type: "application/json"
+    User-Agent: "Python-API-Client/1.0"
+
+# Model Configuration
+models:
+  # If models are provided as a list (pipe-separated), they'll be converted to array
+  available: "{{ Model(s).split('|') if '|' in Model(s) and not Model(s).startswith('http') else [Model(s)] if Model(s) and not Model(s).startswith('http') else [] }}"
+  # If models are provided as URL endpoint
+  endpoint: "{{ Model(s) if Model(s).startswith('http') else '' }}"
+  default: "{{ Model(s).split('|')[0] if '|' in Model(s) and not Model(s).startswith('http') else Model(s) if Model(s) and not Model(s).startswith('http') else '' }}"
+
+# Service Configuration
+service:
+  type: "{{ 'image' if 'Image' in Name else 'text' if 'Text' in Name else 'mixed' }}"
+  requires_auth: {{ 'true' if AuthMode != 'none' else 'false' }}
+  
+# Rate Limiting and Cost Information
+rate_limit:
+  info: "{{ Rate_Limit_Cost_Info if Rate_Limit_Cost_Info else 'Not specified' }}"
+  # Add default rate limiting if needed
+  requests_per_minute: null
+  requests_per_day: null
+  cost_per_request: null
+
+# Template Information (optional)
+template:
+  name: "{{ Template if Template else 'default' }}"
+  version: "1.0"
+  
+# Additional Metadata
+metadata:
+  created_from: "CSV import"
+  timestamp: "{{ timestamp }}"
+  category: "{{ 'no-auth' if AuthMode == 'none' else 'authenticated' }}"
+  
+# Request Configuration Templates
+request_templates:
+  # For text/chat completions
+  chat_completion:
+    method: "POST"
+    endpoint: "{{ Base_URL + '/chat/completions' if 'chat/completions' not in Base_URL else Base_URL }}"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "{{ 'Bearer ' + APIKey if AuthMode == 'bearer' and APIKey else '' }}"
+    body:
+      model: "{{ Model(s).split('|')[0] if '|' in Model(s) and not Model(s).startswith('http') else 'gpt-3.5-turbo' }}"
+      messages: []
+      temperature: 0.7
+      max_tokens: 1000
+  
+  # For image generation
+  image_generation:
+    method: "POST" 
+    endpoint: "{{ Base_URL }}"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "{{ 'Bearer ' + APIKey if AuthMode == 'bearer' and APIKey else '' }}"
+    body:
+      prompt: ""
+      size: "1024x1024"
+      n: 1
+
+# Health Check Configuration
+health_check:
+  enabled: true
+  endpoint: "{{ Base_URL + '/health' if '/health' not in Base_URL else Base_URL }}"
+  timeout: 30
+  
+# Error Handling
+error_handling:
+  retry_attempts: 3
+  retry_delay: 1
+  timeout: 60
+  
+# Logging Configuration
+logging:
+  level: "INFO"
+  log_requests: true
+  log_responses: false
+  log_errors: true
