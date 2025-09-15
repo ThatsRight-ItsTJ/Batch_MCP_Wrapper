@@ -228,7 +228,7 @@ def main():
     """Main function to generate YAML files using template"""
     csv_file = 'g4f_providers_example.csv'
     template_file = 'yaml_template.txt'
-    output_dir = 'request templates'
+    output_dir = 'request_templates'
     
     # Create output directory if it doesn't exist
     Path(output_dir).mkdir(exist_ok=True)
