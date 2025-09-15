@@ -84,99 +84,121 @@ def process_models_field(models_field, base_url, api_key=None, auth_mode=None):
         
         return models
 
-def safe_get(data, key, default=''):
-    """Safely get a value from dictionary, handling NaN and empty values"""
-    value = data.get(key, default)
-    if pd.isna(value) if 'pd' in globals() else (value != value):  # Check for NaN
-        return default
-    return str(value) if value is not None else default
-
 def render_template(template_content, provider_data):
     """Render the template with provider data using direct string replacement"""
     import re
     
-    # Clean the provider data - handle NaN values and empty strings
+    # Clean the provider data - handle empty strings and None values
     clean_data = {}
     for key, value in provider_data.items():
-        if value != value:  # Check for NaN (NaN != NaN is True)
-            clean_data[key] = ''
-        elif value is None:
+        if value is None or value == '':
             clean_data[key] = ''
         else:
             clean_data[key] = str(value).strip()
     
-    # Create template variables with cleaned data
-    template_vars = clean_data.copy()
-    
     # Add timestamp
-    template_vars['timestamp'] = datetime.now().isoformat()
+    clean_data['timestamp'] = datetime.now().isoformat()
     
     # Process models field to get actual model list
     models_list = process_models_field(
-        template_vars.get('Model(s)', ''),
-        template_vars.get('Base_URL', ''),
-        template_vars.get('APIKey', ''),
-        template_vars.get('AuthMode', '')
+        clean_data.get('Model(s)', ''),
+        clean_data.get('Base_URL', ''),
+        clean_data.get('APIKey', ''),
+        clean_data.get('AuthMode', '')
     )
     
-    # Helper function to evaluate template expressions
-    def evaluate_expression(expr):
-        """Evaluate a template expression and return the result"""
+    # Add processed model data
+    clean_data['models_list'] = models_list
+    clean_data['first_model'] = models_list[0] if models_list else 'gpt-3.5-turbo'
+    clean_data['models_endpoint'] = clean_data.get('Model(s)', '') if clean_data.get('Model(s)', '').startswith('http') else ''
+    
+    def evaluate_complex_expression(expr, data):
+        """Evaluate complex template expressions"""
         expr = expr.strip()
         
         # Handle if/else expressions
         if ' if ' in expr and ' else ' in expr:
+            # Parse: "true_value if condition else false_value"
             parts = expr.split(' if ')
-            true_value = parts[0].strip()
+            true_part = parts[0].strip()
             condition_else = parts[1].split(' else ')
             condition = condition_else[0].strip()
-            false_value = condition_else[1].strip()
+            false_part = condition_else[1].strip()
             
-            # Remove quotes from values
-            if true_value.startswith("'") and true_value.endswith("'"):
-                true_value = true_value[1:-1]
-            if false_value.startswith("'") and false_value.endswith("'"):
-                false_value = false_value[1:-1]
+            # Remove quotes from true/false values
+            if true_part.startswith("'") and true_part.endswith("'"):
+                true_part = true_part[1:-1]
+            if false_part.startswith("'") and false_part.endswith("'"):
+                false_part = false_part[1:-1]
             
-            # Evaluate condition
-            if condition == 'APIKey':
-                condition_value = template_vars.get('APIKey', '')
-                return true_value if condition_value and condition_value != 'nan' else false_value
-            elif condition == 'AuthMode':
-                auth_mode = template_vars.get('AuthMode', '').lower()
-                if 'bearer' in condition:
-                    return true_value if auth_mode == 'bearer' else false_value
-                elif 'none' in condition:
-                    return true_value if auth_mode != 'none' else false_value
-                else:
-                    return true_value if auth_mode else false_value
-            elif condition.startswith('AuthMode =='):
-                expected_value = condition.split('==')[1].strip().strip("'\"")
-                auth_mode = template_vars.get('AuthMode', '').lower()
-                return true_value if auth_mode == expected_value else false_value
-            elif condition.startswith('AuthMode !='):
-                expected_value = condition.split('!=')[1].strip().strip("'\"")
-                auth_mode = template_vars.get('AuthMode', '').lower()
-                return true_value if auth_mode != expected_value else false_value
-            elif "startswith('http')" in condition:
+            # Evaluate the condition
+            condition_result = False
+            
+            if ' and ' in condition:
+                # Handle AND conditions
+                and_parts = [p.strip() for p in condition.split(' and ')]
+                condition_result = True
+                for part in and_parts:
+                    if '==' in part:
+                        var_name, expected = [p.strip().strip("'\"") for p in part.split('==')]
+                        actual = data.get(var_name, '')
+                        if actual.lower() != expected.lower():
+                            condition_result = False
+                            break
+                    elif '!=' in part:
+                        var_name, expected = [p.strip().strip("'\"") for p in part.split('!=')]
+                        actual = data.get(var_name, '')
+                        if actual.lower() == expected.lower():
+                            condition_result = False
+                            break
+                    elif part in data:
+                        # Simple variable check
+                        if not data[part]:
+                            condition_result = False
+                            break
+            elif '==' in condition:
+                # Simple equality check
+                var_name, expected = [p.strip().strip("'\"") for p in condition.split('==')]
+                actual = data.get(var_name, '')
+                condition_result = actual.lower() == expected.lower()
+            elif '!=' in condition:
+                # Simple inequality check
+                var_name, expected = [p.strip().strip("'\"") for p in condition.split('!=')]
+                actual = data.get(var_name, '')
+                condition_result = actual.lower() != expected.lower()
+            elif ".startswith('http')" in condition:
+                # URL check
                 var_name = condition.split('.')[0]
-                var_value = template_vars.get(var_name, '')
-                return true_value if var_value.startswith('http') else false_value
+                var_value = data.get(var_name, '')
+                condition_result = var_value.startswith('http')
             elif ' in ' in condition:
+                # Contains check
                 parts = condition.split(' in ')
                 search_term = parts[0].strip().strip("'\"")
                 var_name = parts[1].strip()
-                var_value = template_vars.get(var_name, '')
-                return true_value if search_term in var_value else false_value
+                var_value = data.get(var_name, '')
+                condition_result = search_term in var_value
+            elif condition in data:
+                # Simple variable existence check
+                condition_result = bool(data[condition])
+            
+            # Handle string concatenation in true_part
+            if '+' in true_part:
+                concat_parts = [p.strip() for p in true_part.split('+')]
+                result = ''
+                for part in concat_parts:
+                    if part.startswith("'") and part.endswith("'"):
+                        result += part[1:-1]
+                    else:
+                        result += data.get(part, '')
+                return result if condition_result else false_part
             else:
-                # Generic condition evaluation
-                condition_value = template_vars.get(condition, '')
-                return true_value if condition_value and condition_value != 'nan' else false_value
+                return true_part if condition_result else false_part
         
-        # Handle split expressions for models
+        # Handle split operations
         elif '.split(' in expr:
             if 'Model(s).split' in expr:
-                models_field = template_vars.get('Model(s)', '')
+                models_field = data.get('Model(s)', '')
                 if '|' in models_field and not models_field.startswith('http'):
                     model_list = [model.strip() for model in models_field.split('|') if model.strip()]
                     return str(model_list)
@@ -184,11 +206,10 @@ def render_template(template_content, provider_data):
                     return f'["{models_field}"]'
                 else:
                     return '[]'
-            return '[]'
         
-        # Handle array access like Model(s).split('|')[0]
+        # Handle array access
         elif '[0]' in expr and 'Model(s)' in expr:
-            models_field = template_vars.get('Model(s)', '')
+            models_field = data.get('Model(s)', '')
             if '|' in models_field and not models_field.startswith('http'):
                 first_model = models_field.split('|')[0].strip()
                 return first_model if first_model else 'gpt-3.5-turbo'
@@ -205,22 +226,39 @@ def render_template(template_content, provider_data):
                 if part.startswith("'") and part.endswith("'"):
                     result += part[1:-1]
                 else:
-                    result += template_vars.get(part, '')
+                    result += data.get(part, '')
             return result
         
-        # Handle simple variable references
-        else:
-            return template_vars.get(expr, '')
+        # Handle URL construction
+        elif 'Base_URL' in expr and ('chat/completions' in expr or '/health' in expr):
+            base_url = data.get('Base_URL', '')
+            if 'chat/completions' in expr and 'not in' in expr:
+                return base_url + '/chat/completions' if 'chat/completions' not in base_url else base_url
+            elif '/health' in expr and 'not in' in expr:
+                return base_url + '/health' if '/health' not in base_url else base_url
+            return base_url
+        
+        # Simple variable lookup
+        elif expr in data:
+            return data[expr]
+        
+        # Return empty string for unhandled expressions
+        return ''
     
-    # Replace template expressions
-    def replace_template(match):
+    # Replace all template expressions
+    def replace_template_vars(match):
         expr = match.group(1).strip()
-        result = evaluate_expression(expr)
-        return str(result)
+        
+        # First try simple variable replacement
+        if expr in clean_data:
+            return clean_data[expr]
+        
+        # Then try complex expression evaluation
+        return str(evaluate_complex_expression(expr, clean_data))
     
-    # Handle all template expressions
+    # Apply template replacements
     template_pattern = r'\{\{\s*([^}]+)\s*\}\}'
-    rendered_content = re.sub(template_pattern, replace_template, template_content)
+    rendered_content = re.sub(template_pattern, replace_template_vars, template_content)
     
     return rendered_content
 
