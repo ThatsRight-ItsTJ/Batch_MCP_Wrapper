@@ -25,8 +25,17 @@ import os
 import re
 import time
 import yaml
-from typing import Dict, List, Optional, Any
+import logging
+import asyncio
+import aiohttp
+from typing import Dict, List, Optional, Any, Tuple
 from urllib.parse import quote_plus
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 import pandas as pd
 import requests
@@ -41,6 +50,8 @@ from routers.base_router import MCPBaseRouter
 # Files
 DEFAULT_DOTENV = ".env"
 CACHE_FILE = ".model_caps_cache.json"
+CACHE_TTL = 7 * 24 * 60 * 60  # 7 days in seconds
+CONCURRENT_REQUESTS = 10  # Maximum concurrent HTTP requests
 
 # Capability schemas
 CAPABILITY_SCHEMAS: Dict[str, Dict[str, Any]] = {
@@ -104,6 +115,15 @@ def sanitize_env_name(name: str) -> str:
     return exact, sanitized
 
 
+@dataclass
+class CacheEntry:
+    capabilities: List[str]
+    last_seen: int
+    source: str = "heuristic"  # "heuristic", "internet", "provider"
+    
+    def is_expired(self) -> bool:
+        return time.time() - self.last_seen > CACHE_TTL
+
 def load_cache(cache_path: str = CACHE_FILE) -> Dict[str, Any]:
     if os.path.exists(cache_path):
         try:
@@ -122,24 +142,68 @@ def save_cache(cache: Dict[str, Any], cache_path: str = CACHE_FILE):
         pass
 
 
+def cleanup_expired_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove expired cache entries"""
+    current_time = time.time()
+    cleaned_cache = {}
+    for key, value in cache.items():
+        if isinstance(value, dict):
+            entry = CacheEntry(
+                capabilities=value.get("capabilities", []),
+                last_seen=value.get("last_seen", 0),
+                source=value.get("source", "heuristic")
+            )
+            if not entry.is_expired():
+                cleaned_cache[key] = value
+    return cleaned_cache
+
+
 def guess_capabilities_from_name(model_name: str) -> List[str]:
+    """Enhanced heuristics with improved accuracy to reduce internet lookups"""
     n = model_name.lower()
     caps = []
-    # embedding hints
-    if any(k in n for k in ["embed", "embedding", "vector", "sentence-transformers", "text-embedding"]):
+    
+    # Enhanced embedding hints with higher confidence
+    strong_embedding_indicators = [
+        "embed", "embedding", "vector", "sentence-transformers", "text-embedding",
+        "bert", "roberta", "mpnet", "distilbert", "use", "universal-sentence"
+    ]
+    if any(k in n for k in strong_embedding_indicators):
         caps.append("embedding")
-    # image hints
-    if any(k in n for k in ["image", "dall", "sdxl", "stable", "flux", "diffusion", "sd", "img", "stability"]):
+    
+    # Enhanced image generation hints with higher confidence
+    strong_image_indicators = [
+        "dall", "sdxl", "stable", "flux", "diffusion", "sd", "img", "stability",
+        "midjourney", "dream", "generate", "create", "paint"
+    ]
+    if any(k in n for k in strong_image_indicators):
         caps.append("image")
-    # vision / multimodal
-    if any(k in n for k in ["vision", "multimodal", "clip", "img2txt", "ocr", "visual"]):
+    
+    # Vision / multimodal hints
+    vision_indicators = [
+        "vision", "multimodal", "clip", "img2txt", "ocr", "visual", "vlm", "llava"
+    ]
+    if any(k in n for k in vision_indicators):
         caps.append("vision")
-    # audio hints
-    if any(k in n for k in ["audio", "whisper", "speech", "asr", "wav2vec", "speech-to-text"]):
+    
+    # Audio hints
+    audio_indicators = [
+        "audio", "whisper", "speech", "asr", "wav2vec", "speech-to-text",
+        "whisper", "piper", "faster-whisper"
+    ]
+    if any(k in n for k in audio_indicators):
         caps.append("audio")
-    # chat/ text fallback
+    
+    # Chat/ text fallback - only if no other indicators found
     if not caps:
-        caps.append("text")
+        # Check for text-specific indicators to avoid unnecessary internet lookups
+        text_indicators = ["chat", "completion", "instruct", "llama", "mistral", "gemma", "qwen"]
+        if any(k in n for k in text_indicators):
+            caps.append("text")
+        else:
+            # Default to text for unknown models
+            caps.append("text")
+    
     return caps
 
 
@@ -170,86 +234,71 @@ def build_auth_headers_and_url(authmode: str, base_url: str, api_key: Optional[s
     return {"Authorization": f"Bearer {api_key}"}, base_url
 
 
-def load_template(path_or_url: str) -> Optional[Dict[str, Any]]:
+async def load_template_async(path_or_url: str, session: Optional[aiohttp.ClientSession] = None) -> Optional[Dict[str, Any]]:
+    """Async version of load_template"""
     if not path_or_url:
         return None
     try:
         if path_or_url.startswith("http"):
-            r = requests.get(path_or_url, timeout=10)
-            r.raise_for_status()
-            text = r.text
+            async with session.get(path_or_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                response.raise_for_status()
+                text = await response.text()
         else:
             with open(path_or_url, "r", encoding="utf-8") as f:
                 text = f.read()
+        
         if path_or_url.endswith(".json"):
             return json.loads(text)
         return yaml.safe_load(text)
     except Exception as e:
-        print(f"[WARN] Could not load template {path_or_url}: {e}")
+        logger.warning(f"Could not load template {path_or_url}: {e}")
+        return None
+
+def load_template(path_or_url: str) -> Optional[Dict[str, Any]]:
+    """Synchronous wrapper for load_template"""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If already in an event loop, run in a new thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    load_template_async(path_or_url)
+                )
+                return future.result()
+        else:
+            return asyncio.run(load_template_async(path_or_url))
+    except Exception as e:
+        logger.warning(f"Could not load template {path_or_url}: {e}")
         return None
 
 
 # -------------------------
 # Internet lookup (Hugging Face) fallback
 # -------------------------
-def internet_lookup_capabilities(model_id: str, hf_token: Optional[str] = None) -> List[str]:
+async def internet_lookup_capabilities_async(model_id: str, hf_token: Optional[str] = None, session: Optional[aiohttp.ClientSession] = None) -> List[str]:
     """
-    Query Hugging Face model metadata for pipeline tags and other hints.
-    Returns list of capabilities or empty list if unknown.
+    Async version of internet lookup capabilities using aiohttp
     """
-    # Normalize for HF model path (some model names include /)
-    # First try direct model lookup
+    start_time = time.time()
+    logger.info(f"Starting Hugging Face lookup for model: {model_id}")
+    
     headers = {}
     if hf_token:
         headers["Authorization"] = f"Bearer {hf_token}"
-    model_id_quoted = quote_plus(model_id)
-    # Try direct endpoint for model metadata
+    
+    # Try direct model lookup first
     hf_url = f"https://huggingface.co/api/models/{model_id}"
-
+    
     try:
-        r = requests.get(hf_url, headers=headers, timeout=8)
-        if r.status_code == 200:
-            data = r.json()
-            # pipeline_tag or tags can indicate capability
-            caps = set()
-            pipeline_tag = data.get("pipeline_tag")
-            if pipeline_tag:
-                if "text-generation" in pipeline_tag:
-                    caps.add("text")
-                if "image-generation" in pipeline_tag:
-                    caps.add("image")
-                if pipeline_tag in ("text-embedding", "feature-extraction", "sentence-similarity"):
-                    caps.add("embedding")
-                if pipeline_tag in ("automatic-speech-recognition", "speech-to-text"):
-                    caps.add("audio")
-                # vision tasks
-                if pipeline_tag in ("image-classification", "image-segmentation", "object-detection"):
-                    caps.add("vision")
-            # tags may also include hints
-            tags = data.get("tags", []) or []
-            tstring = " ".join(tags).lower()
-            if any(k in tstring for k in ["embedding", "sentence-transformer", "feature-extraction"]):
-                caps.add("embedding")
-            if any(k in tstring for k in ["image", "diffusion", "img2img", "text-to-image"]):
-                caps.add("image")
-            if any(k in tstring for k in ["audio", "speech", "asr", "wav2vec"]):
-                caps.add("audio")
-            if any(k in tstring for k in ["vision", "multimodal", "clip"]):
-                caps.add("vision")
-            if caps:
-                return list(caps)
-    except Exception:
-        pass
-
-    # If direct lookup fails, try searching
-    try:
-        s_url = f"https://huggingface.co/api/models?search={quote_plus(model_id)}"
-        r = requests.get(s_url, headers=headers, timeout=8)
-        if r.status_code == 200:
-            items = r.json()
-            if items:
-                # take first hit's pipeline_tag if present
-                data = items[0]
+        logger.info(f"Making direct request to: {hf_url}")
+        async with session.get(hf_url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as response:
+            request_time = time.time() - start_time
+            logger.info(f"Direct request completed in {request_time:.2f}s, status: {response.status}")
+            
+            if response.status == 200:
+                data = await response.json()
                 caps = set()
                 pipeline_tag = data.get("pipeline_tag")
                 if pipeline_tag:
@@ -257,20 +306,92 @@ def internet_lookup_capabilities(model_id: str, hf_token: Optional[str] = None) 
                         caps.add("text")
                     if "image-generation" in pipeline_tag:
                         caps.add("image")
-                    if pipeline_tag in ("text-embedding", "feature-extraction"):
+                    if pipeline_tag in ("text-embedding", "feature-extraction", "sentence-similarity"):
                         caps.add("embedding")
+                    if pipeline_tag in ("automatic-speech-recognition", "speech-to-text"):
+                        caps.add("audio")
+                    if pipeline_tag in ("image-classification", "image-segmentation", "object-detection"):
+                        caps.add("vision")
+                
                 tags = data.get("tags", []) or []
                 tstring = " ".join(tags).lower()
-                if "embedding" in tstring:
+                if any(k in tstring for k in ["embedding", "sentence-transformer", "feature-extraction"]):
                     caps.add("embedding")
-                if any(k in tstring for k in ["image", "diffusion", "text-to-image", "img2img"]):
+                if any(k in tstring for k in ["image", "diffusion", "img2img", "text-to-image"]):
                     caps.add("image")
+                if any(k in tstring for k in ["audio", "speech", "asr", "wav2vec"]):
+                    caps.add("audio")
+                if any(k in tstring for k in ["vision", "multimodal", "clip"]):
+                    caps.add("vision")
+                
                 if caps:
+                    total_time = time.time() - start_time
+                    logger.info(f"HF lookup successful for {model_id}: {list(caps)} in {total_time:.2f}s")
                     return list(caps)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Direct HF lookup failed for {model_id}: {e}")
         pass
 
+    # If direct lookup fails, try searching
+    try:
+        s_url = f"https://huggingface.co/api/models?search={quote_plus(model_id)}"
+        logger.info(f"Making search request to: {s_url}")
+        async with session.get(s_url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as response:
+            search_time = time.time() - start_time
+            logger.info(f"Search request completed in {search_time:.2f}s, status: {response.status}")
+            
+            if response.status == 200:
+                items = await response.json()
+                if items:
+                    data = items[0]
+                    caps = set()
+                    pipeline_tag = data.get("pipeline_tag")
+                    if pipeline_tag:
+                        if "text-generation" in pipeline_tag:
+                            caps.add("text")
+                        if "image-generation" in pipeline_tag:
+                            caps.add("image")
+                        if pipeline_tag in ("text-embedding", "feature-extraction"):
+                            caps.add("embedding")
+                    
+                    tags = data.get("tags", []) or []
+                    tstring = " ".join(tags).lower()
+                    if "embedding" in tstring:
+                        caps.add("embedding")
+                    if any(k in tstring for k in ["image", "diffusion", "text-to-image", "img2img"]):
+                        caps.add("image")
+                    if caps:
+                        total_time = time.time() - start_time
+                        logger.info(f"HF search successful for {model_id}: {list(caps)} in {total_time:.2f}s")
+                        return list(caps)
+    except Exception as e:
+        logger.warning(f"HF search lookup failed for {model_id}: {e}")
+        pass
+
+    total_time = time.time() - start_time
+    logger.info(f"HF lookup failed for {model_id} in {total_time:.2f}s")
     return []
+
+def internet_lookup_capabilities(model_id: str, hf_token: Optional[str] = None) -> List[str]:
+    """
+    Synchronous wrapper for internet lookup capabilities
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If already in an event loop, run in a new thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    internet_lookup_capabilities_async(model_id, hf_token)
+                )
+                return future.result()
+        else:
+            return asyncio.run(internet_lookup_capabilities_async(model_id, hf_token))
+    except Exception as e:
+        logger.warning(f"Internet lookup failed for {model_id}: {e}")
+        return []
 
 
 # -------------------------
@@ -397,7 +518,11 @@ def parse_models_for_api(row: Dict[str, Any], cache: Dict[str, Any], hf_token: O
     # Case 1: models_field is an HTTP URL -> fetch provider metadata
     if models_field.startswith("http://") or models_field.startswith("https://"):
         try:
+            logger.info(f"Fetching models from URL: {models_field}")
+            url_start_time = time.time()
             r = requests.get(models_field, headers=headers, timeout=10)
+            url_time = time.time() - url_start_time
+            logger.info(f"URL fetch completed in {url_time:.2f}s, status: {r.status_code}")
             r.raise_for_status()
             data = r.json()
             # Try common shapes: {"data":[...]}, {"models": [...]}, or plain dict mapping
@@ -487,7 +612,11 @@ def parse_models_for_api(row: Dict[str, Any], cache: Dict[str, Any], hf_token: O
                 # try common patterns
                 for candidate in [base_url + "/models", base_url + "/v1/models", base_url + "/api/models"]:
                     try:
+                        logger.info(f"Trying model endpoint: {candidate}")
+                        endpoint_start_time = time.time()
                         r = requests.get(candidate, headers=headers, timeout=6)
+                        endpoint_time = time.time() - endpoint_start_time
+                        logger.info(f"Endpoint {candidate} completed in {endpoint_time:.2f}s, status: {r.status_code}")
                         if r.status_code == 200:
                             data = r.json()
                             raw_models = data.get("data") or data.get("models") or data
@@ -518,18 +647,31 @@ def parse_models_for_api(row: Dict[str, Any], cache: Dict[str, Any], hf_token: O
 # Aggregator server builder
 # -------------------------
 def build_aggregator_app(csv_path: str, dotenv_path: str = DEFAULT_DOTENV, hf_token: Optional[str] = None):
+    start_time = time.time()
+    logger.info(f"Starting to build aggregator app from {csv_path}")
+    
     df_clean = normalize_csv(csv_path)
     generate_env_file_and_set(df_clean, dotenv_path)
 
     cache = load_cache()
 
     apis: List[Dict[str, Any]] = []
-    for _, row in df_clean.iterrows():
+    total_rows = len(df_clean)
+    logger.info(f"Processing {total_rows} providers from CSV")
+    
+    for idx, row in df_clean.iterrows():
+        row_start_time = time.time()
         rowd = row.to_dict()
         # ensure name exists
         name = rowd.get("Name") or rowd.get("name") or "UnknownProvider"
         rowd["Name"] = name
+        
+        logger.info(f"Processing provider {idx+1}/{total_rows}: {name}")
         models = parse_models_for_api(rowd, cache=cache, hf_token=hf_token)
+        
+        row_time = time.time() - row_start_time
+        logger.info(f"Provider {name} took {row_time:.2f}s, found {len(models)} models")
+        
         # annotate each model with a parameter schema (capability-specific)
         for m in models:
             caps = m.get("capabilities", []) or []
@@ -540,6 +682,8 @@ def build_aggregator_app(csv_path: str, dotenv_path: str = DEFAULT_DOTENV, hf_to
         apis.append(rowd)
 
     save_cache(cache)
+    total_time = time.time() - start_time
+    logger.info(f"Completed building aggregator app in {total_time:.2f}s")
 
     # Build FastAPI + MCP router
     app = FastAPI(title="MCP Aggregator Server (generated)")

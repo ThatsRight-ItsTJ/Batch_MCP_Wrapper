@@ -1,3 +1,6 @@
 providers.csv
 .~lock.providers.csv#
 request templates/*
+venv/*
+path/*
+.env
